@@ -619,10 +619,13 @@ document.querySelectorAll(".tab").forEach(tab=>{
   async function ethosAsk(question, context, history){
     if(ETHOS_AI.url.indexOf("__")===0){ return {ok:false,offline:true}; }
     try{
-      const r=await fetch(ETHOS_AI.url,{method:"POST",headers:{"content-type":"application/json"},
-        body:JSON.stringify({app:ETHOS_AI.app,token:ETHOS_AI.token,question:question,context:context||"",history:history||[]})});
-      const j=await r.json().catch(function(){return {});});
-      if(!r.ok) return {ok:false,error:(j&&j.error)||"잠시 후 다시 시도해 주세요."};
+      const r=await fetch(ETHOS_AI.url,{
+        method:"POST",
+        headers:{"content-type":"application/json"},
+        body:JSON.stringify({app:ETHOS_AI.app,token:ETHOS_AI.token,question:question,context:context||"",history:history||[]})
+      });
+      const j=await r.json().catch(function(){return {};});
+      if(!r.ok){ return {ok:false,error:(j&&j.error)||"잠시 후 다시 시도해 주세요."}; }
       return {ok:true,answer:j.answer};
     }catch(e){ return {ok:false,error:"연결에 실패했습니다."}; }
   }
