@@ -1,3 +1,4 @@
+<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
@@ -213,7 +214,502 @@
 </div>
 <div class="toast" id="toast"></div>
 
+<script>
+/* ============ 데이터 (가게 정보 — context로 요약) ============ */
+const MENU = [
+  {name:"솔라 블렌드", tag:"핸드드립", desc:"매일 조금씩 다른 싱글오리진을 블렌딩한 하우스 커피. 산미와 단맛의 균형이 좋습니다.", price:"6,500원", seed:"solar-blend"},
+  {name:"버터 스콘", tag:"베이커리", desc:"겉은 바삭, 속은 촉촉. 잼과 클로티드 크림이 곁들여집니다. 아침·오후 언제든 잘 어울려요.", price:"5,000원", seed:"solar-scone"},
+  {name:"콜드 브루 라테", tag:"시그니처", desc:"콜드 브루에 우유를 더한 부드러운 라테. 더운 날 시원하게, 은은한 초콜릿 향이 있습니다.", price:"6,000원", seed:"solar-cold"}
+];
 
+const SHOP = {
+  name:"solar 카페",
+  open:"매일 09:00–21:00 (마지막 주문 20:30)",
+  break:"별도 휴식 시간 없이 영업합니다.",
+  holiday:"설·추석 당일만 휴무합니다.",
+  reserve:"전화(010-0000-0000) 또는 이 페이지 '예약' 탭에서 날짜·시간을 고르고 성함을 적어 신청하기 버튼을 누르시면 됩니다. 같은 시간은 한 팀만 받습니다.",
+  parking:"건물 뒤쪽 무료 주차 2면 있습니다(첫째·둘째 칸). 만차 시에는 도보 3분 거리 골목에 주차해 주세요.",
+  address:"서울 마포구 월드컵로12길 14, 1층 (월드컵경기장역 1번 출구 도보 6분)",
+  phone:"010-0000-0000"
+};
+
+/* ============ 메뉴 렌더링 ============ */
+(function renderMenu(){
+  const grid = document.getElementById("menuGrid");
+  grid.innerHTML = MENU.map(m=>`
+    <div class="menu-card">
+      <div class="menu-top">
+        <div class="menu-img">
+          <img src="https://picsum.photos/seed/${m.seed}/160/160" alt="${m.name}" loading="lazy"
+               onerror="this.style.display='none';this.parentElement.style.background='#e7d9c4'">
+        </div>
+        <div class="menu-body">
+          <div class="menu-name">${m.name}</div>
+          <span class="menu-tag">${m.tag}</span>
+          <p class="menu-desc">${m.desc}</p>
+          <div class="menu-line"><span>가격</span><b>${m.price}</b></div>
+        </div>
+      </div>
+    </div>
+  `).join("");
+})();
+
+/* ============ 탭 전환 ============ */
+const PANEL_MAP = { menu:"panel-menu", reserve:"panel-reserve", chat:"panel-chat" };
+document.querySelectorAll(".tab").forEach(tab=>{
+  tab.addEventListener("click", ()=>{
+    const key = tab.dataset.tab;
+    if(!(key in PANEL_MAP)){ return; }
+    document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+    document.querySelectorAll(".panel").forEach(p=>p.classList.remove("active"));
+    tab.classList.add("active");
+    document.getElementById(PANEL_MAP[key]).classList.add("active");
+    if(key==="chat") scrollChat();
+  });
+});
+
+/* ============ 예약 슬롯 ============ */
+(function(){
+  const dateSelect = document.getElementById("dateSelect");
+  const timeRow = document.getElementById("timeRow");
+  const nameInput = document.getElementById("nameInput");
+  const noteInput = document.getElementById("noteInput");
+  const reserveBtn = document.getElementById("reserveBtn");
+  const reserveResult = document.getElementById("reserveResult");
+
+  // 날짜 옵션: 오늘 ~ 14일 뒤 (운영일 기준, 토/일도 받는다고 가정)
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const optToday = document.createElement("option");
+  optToday.value = today.toISOString().slice(0,10);
+  optToday.textContent = "오늘 ("+fmtDate(today)+")";
+  optToday.disabled = false;
+  dateSelect.appendChild(optToday);
+  for(let i=1;i<=14;i++){
+    const d = new Date(today); d.setDate(d.getDate()+i);
+    const o = document.createElement("option");
+    o.value = d.toISOString().slice(0,10);
+    o.textContent = (i===1?"내일":fmtDate(d)) + " ("+d.getMonth()+"월 "+d.getDate()+"일)";
+    dateSelect.appendChild(o);
+  }
+
+  // 시간 슬롯: 10:00 ~ 20:00 (30분 단위, 마지막 시작 20:00은 마감시간으로 두지 않음)
+  const slots = [];
+  for(let h=10; h<=19; h++){
+    slots.push(fmtTime(h,0));
+    slots.push(fmtTime(h,30));
+  }
+  // 20:00 마지막 주문 마감을 반영: 19:30 까지 가능 → 20:00은 '마지막 주문' 표기로만
+  // (선택 가능한 마지막 시작 = 19:30)
+
+  let selectedTime = null;
+  let takenOffline = {}; // 미리보기용 오프라인 제약(지금 이 기기에서만)
+
+  function buildTimeRow(){
+    timeRow.innerHTML = "";
+    slots.forEach(t=>{
+      const b = document.createElement("button");
+      b.className = "slot";
+      b.dataset.time = t;
+      b.textContent = t;
+      b.setAttribute("aria-label", t+" 예약");
+      timeRow.appendChild(b);
+    });
+    applyTakenState();
+  }
+
+  function applyTakenState(){
+    timeRow.querySelectorAll(".slot").forEach(s=>{
+      const t = s.dataset.time;
+      const offline = takenOffline[t];
+      const online = ONLINE_TAKEN[t]; // 게시 후 실제 슬롯(오프라인에선 비워둠)
+      if(offline || online){
+        s.classList.add("taken");
+      }
+    });
+  }
+
+  // 미리보기(오프라인) 전용: 특정 시간을 로컬에서 잡아보는 시연용 토글
+  // (게시 후엔 실제 서버 슬롯이 적용됨)
+  function toggleOfflineDemo(){
+    // 데모용으로 현재 선택된 시간이 없으면 첫 번째 가능 시간을 예시로 잡음
+    const avail = slots.find(t=>!takenOffline[t]);
+    if(!avail) return;
+    takenOffline[avail] = !takenOffline[avail];
+    applyTakenState();
+    toast(avail + (takenOffline[avail]?" → 마감 데모":" → 해제"));
+  }
+  window.__demoToggle = toggleOfflineDemo;
+
+  buildTimeRow();
+
+  // 시간 선택
+  timeRow.addEventListener("click", e=>{
+    const s = e.target.closest(".slot");
+    if(!s) return;
+    if(s.classList.contains("taken")){
+      toast("이미 마감된 시간입니다.");
+      return;
+    }
+    timeRow.querySelectorAll(".slot").forEach(x=>x.classList.remove("selected"));
+    s.classList.add("selected");
+    selectedTime = s.dataset.time;
+    updateBtn();
+  });
+
+  function fmtDate(d){
+    const y=d.getFullYear(), m=d.getMonth()+1, dd=d.getDate();
+    return y+"-"+String(m).padStart(2,"0")+"-"+String(dd).padStart(2,"0");
+  }
+  function fmtTime(h,m){
+    return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0");
+  }
+
+  function updateBtn(){
+    const ok = selectedTime && nameInput.value.trim().length>=1;
+    reserveBtn.disabled = !ok;
+    if(selectedTime && nameInput.value.trim().length<1){
+      reserveBtn.textContent = "예약자 이름을 적어주세요";
+    } else if(!selectedTime){
+      reserveBtn.textContent = "시간을 선택하세요";
+    } else {
+      reserveBtn.textContent = "예약 신청하기 ("+selectedTime+")";
+    }
+  }
+  nameInput.addEventListener("input", updateBtn);
+  noteInput.addEventListener("input", updateBtn);
+
+  nameInput.addEventListener("focus", ()=>{
+    if(!selectedTime){
+      // 가능한 첫 시간 자동 선택 도움
+      const first = slots.find(t=>!takenOffline[t]);
+      if(first){ selectedTime=first; timeRow.querySelectorAll(".slot").forEach(x=>{if(x.dataset.time===first) x.classList.add("selected")}); }
+    }
+    updateBtn();
+  });
+
+  /* ---------- 접수 저장 + 알림 (에토스 계약) ---------- */
+  window.ETHOS_DATA={url:"https://mnwnzyhhqimzrbvwmnan.supabase.co",key:"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1ud256eWhocWltenJidndtbmFuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg3ODkyMjEsImV4cCI6MjEwNDM2NTIyMX0.zFL9hz2f78B9YvR7b9QWg3wuld3V6dLu8UxlyxqigNw",app:"cafe-solar"};
+  window.ETHOS_NOTIFY={url:"https://ethos.ai.kr/api/apps/notify-relay",token:"3c6ceed2c25a5b929c61d85b37297e994e9565a5c572afea"};
+
+  async function ethosSubmit(payload){
+    if(ETHOS_DATA.url.indexOf("__")===0){ return {ok:false,offline:true}; }
+    try{
+      const r=await fetch(ETHOS_DATA.url+"/rest/v1/ethos_submissions",{
+        method:"POST",
+        headers:{
+          apikey:ETHOS_DATA.key,
+          Authorization:"Bearer "+ETHOS_DATA.key,
+          "content-type":"application/json",
+          Prefer:"return=minimal"
+        },
+        body:JSON.stringify({app:ETHOS_DATA.app, payload:payload})
+      });
+      return {ok:r.ok};
+    }catch(e){ return {ok:false}; }
+  }
+  async function ethosSlotList(kind){
+    if(ETHOS_DATA.url.indexOf("__")===0){ return {ok:false,offline:true,rows:[]}; }
+    try{
+      const r=await fetch(ETHOS_DATA.url+"/rest/v1/ethos_slots?select=slot_key&app=eq."+encodeURIComponent(ETHOS_DATA.app)+"&kind=eq."+encodeURIComponent(kind),{
+        headers:{apikey:ETHOS_DATA.key,Authorization:"Bearer "+ETHOS_DATA.key}
+      });
+      return {ok:r.ok, rows: r.ok? await r.json():[]};
+    }catch(e){ return {ok:false,rows:[]}; }
+  }
+  async function ethosSlotTake(kind,slotKey){
+    if(ETHOS_DATA.url.indexOf("__")===0){ return {ok:false,offline:true}; }
+    try{
+      const r=await fetch(ETHOS_DATA.url+"/rest/v1/ethos_slots",{
+        method:"POST",
+        headers:{apikey:ETHOS_DATA.key,Authorization:"Bearer "+ETHOS_DATA.key,"content-type":"application/json",Prefer:"return=minimal"},
+        body:JSON.stringify({app:ETHOS_DATA.app,kind:kind,slot_key:slotKey})
+      });
+      if(r.status===409) return {ok:false,taken:true};
+      return {ok:r.ok};
+    }catch(e){ return {ok:false}; }
+  }
+  function ethosNotify(summary){
+    if(ETHOS_NOTIFY.url.indexOf("__")===0) return;
+    try{
+      fetch(ETHOS_NOTIFY.url,{method:"POST",headers:{"content-type":"application/json"},
+        body:JSON.stringify({token:ETHOS_NOTIFY.token,summary:String(summary||"").slice(0,300)})});
+    }catch(e){}
+  }
+
+  /* ---------- 예약 신청 ---------- */
+  reserveBtn.addEventListener("click", async ()=>{
+    if(!selectedTime || !nameInput.value.trim()) return;
+    const date = dateSelect.value;
+    const kind = "solar_cafe_reserve";
+    const slotKey = date + "|" + selectedTime; // 개인정보가 아닌 시간·자원 식별자
+
+    // 1) 슬롯 선점
+    let takeResult;
+    if(ETHOS_DATA.url.indexOf("__")===0){
+      // 미리보기: 이 기기 기준 로컬 데모 슬롯
+      takeResult = await ethosSlotTake(kind, slotKey);
+      // 로컬에서 이미 잡혀있으면 taken
+      if(takeResult && takeResult.taken){ showResult("err","이미 다른 예약이 잡힌 시간입니다. 다른 시간을 선택해 주세요."); return; }
+      if(takeResult && !takeResult.ok && takeResult.offline!==true){
+        // 오프라인 데모에서 선점 성공 시 로컬 taken 등록
+        takenOffline[slotKey] = true;
+        applyTakenState();
+      }
+    } else {
+      takeResult = await ethosSlotTake(kind, slotKey);
+      if(takeResult.taken){ showResult("err","방금 다른 손님이 그 시간을 예약했습니다. 다른 시간을 선택해 주세요."); return; }
+      if(!takeResult.ok){ showResult("err","예약 선점 중 오류가 났습니다. 잠시 뒤 다시 시도해 주세요."); return; }
+    }
+
+    // 2) 접수 저장(이름·연락처 등 개인정보는 접수함으로만)
+    const payload = {
+      type:"solar_cafe_reserve",
+      date:date,
+      time:selectedTime,
+      name:nameInput.value.trim(),
+      note:noteInput.value.trim(),
+      createdAt:new Date().toISOString()
+    };
+    const sub = await ethosSubmit(payload);
+    if(sub.offline){
+      // 게시 전 미리보기: 로컬에만 표시하고 "게시 후 실제 접수 저장" 안내
+      showResult("off",
+        "<b>예약 요청 접수됨 (미리보기)</b><br>"+
+        "︎예약 일시: "+fmtDateStr(date)+" "+selectedTime+"<br>"+
+        "예약자: "+escapeHtml(payload.name)+
+        (payload.note? "<br>요청: "+escapeHtml(payload.note):"")+
+        "<br><br>이 상태에선 아직 사장님께 접수되지 않습니다. <b>게시 후</b>에는 실제 접수가 저장되고 알림도 발송됩니다.",
+        "예약번호(미리보기): "+makeCode());
+      return;
+    }
+    if(!sub.ok){
+      // 실패: 로컬에 임시 저장 + 전화 확인 안내
+      try{
+        localStorage.setItem("solar_cafe_pending_"+makeCode(), JSON.stringify(payload));
+      }catch(e){}
+      showResult("err",
+        "접수 저장에 실패했습니다. <b>전화(010-0000-0000)</b>로 직접 예약하시거나, 조금 뒤 다시 시도해 주세요.<br>"+
+        "예약 정보: "+fmtDateStr(date)+" "+selectedTime+" / "+escapeHtml(payload.name));
+      return;
+    }
+
+    // 3) 알림 (결과를 기다리지 않음 — 접수 화면을 막지 않음)
+    ethosNotify("solar 카페 예약 1건 · "+fmtDateStr(date)+" "+selectedTime+" · "+escapeHtml(payload.name)+"님");
+
+    showResult("ok",
+      "<b>예약이 접수되었습니다</b><br>︎예약 일시: "+fmtDateStr(date)+" "+selectedTime+"<br>"+
+      "예약자: "+escapeHtml(payload.name)+
+      (payload.note? "<br>요청: "+escapeHtml(payload.note):"")+
+      "<br><br>접수번호: <span class='code'>"+makeCode()+"</span><br>"+
+      "<span style='font-size:12px;color:var(--muted)'>확인 메일이 준비되면 안내해 드립니다. 변경·취소는 전화(010-0000-0000)로 부탁드립니다.</span>",
+      "접수 확인");
+
+    // 예약 후 폼 정리(시간은 선택된 그대로 둬서 중복 확인 가능하게)
+    nameInput.value = "";
+    noteInput.value = "";
+    timeRow.querySelectorAll(".slot").forEach(x=>x.classList.remove("selected"));
+    selectedTime = null;
+    updateBtn();
+  });
+
+  function fmtDateStr(s){
+    const d=new Date(s+"T00:00:00");
+    return d.getMonth()+"월 "+d.getDate()+"일 ("+["일","월","화","수","목","금","토"][d.getDay()]+")";
+  }
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  }
+  function makeCode(){
+    return "solar-"+String(Math.floor(100000+Math.random()*900000));
+  }
+  function showResult(type, html, label){
+    reserveResult.className = "result show "+type;
+    reserveResult.innerHTML = "<b>"+escapeHtml(label||"결과")+"</b><br>"+html;
+    reserveResult.scrollIntoView({behavior:"smooth",block:"nearest"});
+  }
+  function toast(msg){
+    const t=document.getElementById("toast");
+    t.textContent=msg;
+    t.classList.add("show");
+    clearTimeout(t._t);
+    t._t=setTimeout(()=>t.classList.remove("show"), 1800);
+  }
+
+  // 초기 버튼 상태
+  updateBtn();
+
+  // 온라인 슬롯 데이터: 게시 후 ethosSlotList 로 받아 반영(이 기기에서만 캐시)
+  (async ()=>{
+    if(ETHOS_DATA.url.indexOf("__")===0) return; // 미리보기
+    try{
+      const rows = await ethosSlotList("solar_cafe_reserve");
+      if(rows.ok){
+        ONLINE_TAKEN = {};
+        rows.rows.forEach(r=>{ if(r.slot_key) ONLINE_TAKEN[r.slot_key]=true; });
+        applyTakenState();
+      }
+    }catch(e){}
+  })();
+  let ONLINE_TAKEN = {};
+})();
+
+/* ============ AI 상담 (내장 FAQ + 게시 후 실제 AI) ============ */
+(function(){
+  const chatMsg = document.getElementById("chatMsg");
+  const chatInput = document.getElementById("chatInput");
+  const chatSend = document.getElementById("chatSend");
+  const chatDot = document.getElementById("chatDot");
+  const chatStatus = document.getElementById("chatStatus");
+
+  const FAQ = [
+    {k:"영업시간", a:"solar 카페은 매일 09:00부터 21:00까지 영업합니다. 마지막 주문은 20:30입니다. 설·추석 당일을 제외하고는 쉬는 날 없이 엽니다."},
+    {k:"영업시간이 어떻게 되나요", a:"매일 09:00–21:00 운영합니다(마지막 주문 20:30). 휴식 시간 없이 계속 엽니다. 설·추석 당일만 휴무합니다."},
+    {k:"메뉴 추천해줘", a:"기분 따라 골라 보세요. \n• 솔라 블렌드(6,500원): 매일 조금씩 다른 싱글오리진 블렌딩, 산미와 단맛의 균형이 좋습니다.\n• 버터 스콘(5,000원): 겉바속촉, 잼·클로티드 크림이 곁들여집니다.\n• 콜드 브루 라테(6,000원): 시원한 라테를 좋아하시면 추천합니다. 은은한 초콜릿 향이 있어요."},
+    {k:"메뉴", a:"대표 메뉴는 솔라 블렌드(핸드드립, 6,500원), 버터 스콘(베이커리, 5,000원), 콜드 브루 라테(시그니처, 6,000원)입니다. 더 자세한 설명은 메뉴 탭에서 확인하실 수 있어요."},
+    {k:"예약은 어떻게 하나요", a:"이 페이지의 '예약' 탭에서 날짜·시간을 고르고 성함을 적어 '예약 신청하기'를 누르시면 됩니다. 같은 시간은 한 팀만 받아요. 변경·취소는 전화(010-0000-0000)로 부탁드립니다."},
+    {k:"예약 방법", a:"예약 탭에서 날짜와 가능 시간을 선택한 뒤 예약자 이름을 적어 신청하기 버튼을 누르시면 접수가 저장됩니다. 이미 마감된 시간은 선택할 수 없습니다."},
+    {k:"주차 되나요", a:"건물 뒤쪽에 무료 주차 2면이 있습니다(첫째·둘째 칸). 만차일 때는 도보 3분 거리 골목에 주차해 주세요."},
+    {k:"주차", a:"건물 뒤 무료 주차 2면이 있고, 만차 시 도보 3분 거리 골목에 주차 가능합니다."},
+    {k:"위치 어디인가요", a:"서울 마포구 월드컵로12길 14, 1층입니다. 월드컵경기장역 1번 출구에서 도보 6분 정도 걸려요."},
+    {k:"위치", a:"서울 마포구 월드컵로12길 14, 1층(월드컵경기장역 1번 출구 도보 6분)입니다."},
+    {k:"전화번호", a:"010-0000-0000 으로 연락 주시면 됩니다. 예약·변경·문의 모두 이 번호로 받습니다."},
+    {k:"연락처", a:"010-0000-0000 입니다."},
+    {k:"ai", a:"AI 상담은 게시 후 사장님이 '내 앱 → AI 연결'에서 본인 AI 키를 등록하면 실제 답변을 보냅니다. 지금은 자주 묻는 질문(FAQ)으로 우선 답변해 드리고 있어요."}
+  ];
+
+  function answerByFAQ(q){
+    const ql = q.toLowerCase().replace(/[^가-힣a-z0-9\s]/g,"");
+    // 키워드 매칭: 짧은 질문이면 여러 후보를 점수화하여 가장 잘 맞는 것 반환
+    let best=null, bestScore=-1;
+    FAQ.forEach(f=>{
+      const fk = f.k.toLowerCase();
+      // 완전 포함 or 핵심어 포함
+      let score = 0;
+      if(ql.includes(fk)) score += 2;
+      // 단어 단위 매칭
+      fk.split(" ").forEach(word=>{ if(word.length>=2 && ql.includes(word)) score+=1; });
+      // 질문 끝부분 일치 보너스
+      if(q.endsWith(fk) || q.endsWith(fk+"요") || q.endsWith(fk+"까")) score+=1;
+      if(score>bestScore){ bestScore=score; best=f; }
+    });
+    return best;
+  }
+
+  function appendMsg(text, type){
+    const div = document.createElement("div");
+    div.className = "msg "+type;
+    // 개행 보존
+    div.textContent = text;
+    chatMsg.appendChild(div);
+    chatMsg.scrollTop = chatMsg.scrollHeight;
+  }
+  function appendSystem(text){
+    const div = document.createElement("div");
+    div.className = "msg system";
+    div.textContent = text;
+    chatMsg.appendChild(div);
+    chatMsg.scrollTop = chatMsg.scrollHeight;
+  }
+
+  function scrollChat(){
+    chatMsg.scrollTop = chatMsg.scrollHeight;
+  }
+
+  async function ethosAsk(question, context, history){
+    if(ETHOS_AI.url.indexOf("__")===0){ return {ok:false,offline:true}; }
+    try{
+      const r=await fetch(ETHOS_AI.url,{
+        method:"POST",
+        headers:{"content-type":"application/json"},
+        body:JSON.stringify({app:ETHOS_AI.app,token:ETHOS_AI.token,question:question,context:context||"",history:history||[]})
+      });
+      const j=await r.json().catch(function(){return {};});
+      if(!r.ok){ return {ok:false,error:(j&&j.error)||"잠시 후 다시 시도해 주세요."}; }
+      return {ok:true,answer:j.answer};
+    }catch(e){ return {ok:false,error:"연결에 실패했습니다."}; }
+  }
+  window.ETHOS_AI={url:"https://mnwnzyhhqimzrbvwmnan.supabase.co/functions/v1/ethos-ask",token:"3c6ceed2c25a5b929c61d85b37297e994e9565a5c572afea",app:"cafe-solar"};
+
+  // context 로 가게 정보 요약 제공
+  const CONTEXT = [
+    "가게명: solar 카페",
+    "영업시간: 매일 09:00–21:00 (마지막 주문 20:30), 설·추석 당일만 휴무",
+    "대표 메뉴: 솔라 블렌드(6,500원, 핸드드립), 버터 스콘(5,000원, 베이커리), 콜드 브루 라테(6,000원, 시그니처)",
+    "예약: 이 페이지 예약 탭에서 날짜·시간·성함을 적어 신청, 같은 시간은 한 팀만 가능",
+    "주차: 건물 뒤 무료 주차 2면, 만차 시 도보 3분 거리 골목 주차",
+    "주소: 서울 마포구 월드컵로12길 14, 1층 (월드컵경기장역 1번 출구 도보 6분)",
+    "연락처: 010-0000-0000"
+  ].join("\n");
+
+  let history = [];
+
+  async function sendMessage(q){
+    if(!q.trim()) return;
+    appendMsg(q, "usr");
+    chatInput.value="";
+    chatInput.focus();
+    chatSend.disabled = true;
+
+    // FAQ 우선 매칭
+    const faq = answerByFAQ(q);
+    if(faq){
+      appendMsg(faq.a, "bot");
+      history.push({q:q, a:faq.a});
+      if(history.length>5) history.shift();
+      chatSend.disabled = false;
+      return;
+    }
+
+    // 게시 후 AI
+    if(ETHOS_AI.url.indexOf("__")===0){
+      appendSystem("아직 AI 답변 준비 중입니다. 자주 묻는 질문(FAQ)을 먼저 확인해 보세요. 메뉴·영업시간·예약 방법을 물어보시면 바로 답해 드립니다.");
+      chatSend.disabled = false;
+      return;
+    }
+
+    // AI 있음: 표시 + 질문
+    chatDot.className = "dot";
+    chatStatus.textContent = "AI 답변 중…";
+    const res = await ethosAsk(q, CONTEXT, history);
+    chatDot.className = res.ok ? "dot" : "dot off";
+    chatStatus.textContent = res.ok ? "solar 카페 AI" : "AI 연결 중";
+
+    if(res.ok){
+      appendMsg(res.answer, "bot");
+      history.push({q:q, a:res.answer});
+      if(history.length>5) history.shift();
+    } else {
+      appendMsg(res.error || "죄송합니다. 잠시 후 다시 질문해 주세요.", "bot");
+    }
+    chatSend.disabled = false;
+    scrollChat();
+  }
+
+  chatSend.addEventListener("click", ()=> sendMessage(chatInput.value));
+  chatInput.addEventListener("keydown", e=>{
+    if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendMessage(chatInput.value); }
+  });
+  document.getElementById("faq").addEventListener("click", e=>{
+    const b = e.target.closest("button");
+    if(!b) return;
+    const q = b.dataset.q;
+    chatInput.value = q;
+    sendMessage(q);
+  });
+
+  // 초기 상태: 미리보기 모드 안내(이미 FAQ 답변을 보이므로 별도 안내 생략)
+})();
+
+/* ============ 토스트 헬퍼 전역 ============ */
+window.toast = function(msg){
+  const t=document.getElementById("toast");
+  t.textContent=msg;
+  t.classList.add("show");
+  clearTimeout(t._t);
+  t._t=setTimeout(()=>t.classList.remove("show"), 1800);
+};
+</script>
 
 <!--ethos-badge--><div style="text-align:center;padding:16px 8px 20px;font:12px/1.6 -apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#9aa1a9">이 페이지는 <a href="https://ethos.ai.kr" target="_blank" rel="noopener" style="color:#8a919b;text-decoration:underline">에토스AI 코드</a>로 만들어졌습니다</div>
 </body>
